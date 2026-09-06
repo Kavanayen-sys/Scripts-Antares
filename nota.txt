@@ -1,0 +1,2 @@
+Permisos de ejecucion
+chmod 700
