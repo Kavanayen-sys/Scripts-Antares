@@ -1,0 +1,17 @@
+# ==============================================================================
+# Rutinas de Respaldo SiGeRU - Servidor de Aplicaciones (192.168.1.10)
+# ==============================================================================
+
+# 1. INCREMENTAL DIARIO: Lunes a Sábado a las 02:00
+0 2 * * 1-6 /usr/local/bin/backup-sigeru.sh incremental >/dev/null 2>&1
+
+# 2. DIFERENCIAL SEMANAL: Domingos a las 03:00 (Excepto el primer domingo del mes)
+0 3 * * 0 [ $(date +\%e) -gt 7 ] && /usr/local/bin/backup-sigeru.sh diferencial >/dev/null 2>&1
+
+# 3. COMPLETO MENSUAL: Primer Domingo de cada mes a las 04:00
+0 4 1-7 * 0 [ $(date +\%u) -eq 7 ] && /usr/local/bin/backup-sigeru.sh completo >/dev/null 2>&1
+
+
+#Nota sobre la condición del domingo:
+#[ $(date +\%e) -gt 7 ] asegura que el diferencial solo corra desde el día 8 en adelante (los domingos que no son el primero del mes).
+#1-7 * 0 junto con [ $(date +\%u) -eq 7 ] asegura que el completo mensual se ejecute únicamente el primer domingo del mes a las 04:00.

@@ -1,0 +1,12 @@
+# ==============================================================================
+# Rutinas de Respaldo SiGeRU - Servidor de Base de Datos (192.168.1.11)
+# ==============================================================================
+
+# 1. INCREMENTAL DIARIO: Lunes a Sábado a la 01:30 (antes de las 02:00 de la App)
+30 1 * * 1-6 /usr/local/bin/backup-mysql.sh incremental >/dev/null 2>&1
+
+# 2. DIFERENCIAL SEMANAL: Domingos a las 02:30 (Excepto el primer domingo del mes)
+30 2 * * 0 [ $(date +\%e) -gt 7 ] && /usr/local/bin/backup-mysql.sh diferencial >/dev/null 2>&1
+
+# 3. COMPLETO MENSUAL: Primer Domingo de cada mes a las 03:30 (antes de las 04:00 de la App)
+30 3 1-7 * 0 [ $(date +\%u) -eq 7 ] && /usr/local/bin/backup-mysql.sh completo >/dev/null 2>&1
