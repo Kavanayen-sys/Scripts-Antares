@@ -1,15 +1,12 @@
 #!/bin/bash
 
 # ==============================================================================
-# SiGeRU - Gestión de respaldos REALES de Base de Datos (GFS)
+# SiGeRU - Gestión de respaldos MySQL (Esquema GFS Real)
 # Servidor de Base de Datos (192.168.1.11)
-# Esquema: Completo (mysqldump + coordenadas) + Diferencial (Binlogs) + Incremental (Binlogs)
 # ==============================================================================
 
-# Atrapa errores reales dentro de cualquier tubería (|)
 set -o pipefail
 
-# Configuración del servidor de backup
 SERVIDOR_BACKUP="192.168.1.12"
 USUARIO_BACKUP="respaldo"
 PUERTO_SSH="2026"
@@ -18,7 +15,6 @@ NOMBRE_BD="sigeru"
 DIR_MYSQL="/var/lib/mysql"
 BINLOG_INDEX="$DIR_MYSQL/binlog.index"
 
-# Rutas de control y temporales
 RUTA_TEMP="/var/backups/sigeru-mysql"
 DIR_CONTROL="/var/lib/sigeru-backup"
 MARKER_BASE="$DIR_CONTROL/mysql_base_coords.txt"
@@ -49,9 +45,7 @@ PrepararDirectorios() {
 }
 
 
-# Obtiene tanto el archivo como la posición exacta en bytes
 ObtenerCoordenadasBinlog() {
-    # Compatible con MySQL 8.4 (SHOW BINARY LOG STATUS) y versiones previas (SHOW MASTER STATUS)
     local status
     status=$(mysql -N -e "SHOW BINARY LOG STATUS;" 2>/dev/null || mysql -N -e "SHOW MASTER STATUS;" 2>/dev/null)
     local arch=$(echo "$status" | awk '{print $1}')
@@ -115,14 +109,12 @@ EjecutarRotacion() {
 
 
 # ------------------------------------------------------------------------------
-# 1. RESPALDO COMPLETO MENSUAL (Dump lógico base + Coordenadas exactas)
+# 1. COMPLETO MENSUAL (mysqldump base con coordenadas integradas)
 # ------------------------------------------------------------------------------
 BackupCompleto() {
     local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-completo-$FECHA.sql.bz2"
-    RegistrarLog "Iniciando RESPALDO COMPLETO MENSUAL (mysqldump base con coordenadas)..."
+    RegistrarLog "Iniciando RESPALDO COMPLETO MENSUAL de MySQL ($NOMBRE_BD)..."
 
-    # --source-data=2 (o --master-data=2) graba las coordenadas dentro del propio .sql
-    # --flush-logs inicia un binlog nuevo limpio
     mysqldump \
         --single-transaction \
         --quick \
@@ -135,27 +127,26 @@ BackupCompleto() {
 
     local dump_status=$?
     if [ $dump_status -eq 0 ] && [ -s "$archivo" ]; then
-        # Guardamos Archivo y Posición exacta (Punto Cero del mes)
         local coords
         coords=$(ObtenerCoordenadasBinlog)
         echo "$coords" > "$MARKER_BASE"
         echo "$coords" > "$MARKER_LAST"
 
-        RegistrarLog "Completo mensual generado ($archivo). Punto base: $coords"
+        RegistrarLog "Completo mensual generado ($archivo). Coordenadas: $coords"
         EnviarBackup "$archivo" "mensuales"
     else
-        RegistrarLog "ERROR: Falló mysqldump completo (Código de error: $dump_status)."
+        RegistrarLog "ERROR: Falló mysqldump completo."
         rm -f "$archivo"
     fi
 }
 
 
 # ------------------------------------------------------------------------------
-# 2. RESPALDO DIFERENCIAL SEMANAL (Binlogs acumulados desde el Completo Mensual)
+# 2. DIFERENCIAL SEMANAL (Binlogs acumulados + metadata.txt empaquetado)
 # ------------------------------------------------------------------------------
 BackupDiferencial() {
     local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-diferencial-$FECHA.tar.bz2"
-    RegistrarLog "Iniciando RESPALDO DIFERENCIAL SEMANAL (Binlogs acumulados del mes)..."
+    RegistrarLog "Iniciando RESPALDO DIFERENCIAL SEMANAL (Binlogs acumulados)..."
 
     if [ ! -f "$MARKER_BASE" ]; then
         RegistrarLog "ADVERTENCIA: No existe punto de inicio mensual. Ejecutando respaldo completo primero."
@@ -163,26 +154,24 @@ BackupDiferencial() {
         return
     fi
 
+    local coords_inicio
+    coords_inicio=$(cat "$MARKER_BASE")
     local binlog_inicio
-    binlog_inicio=$(awk '{print $1}' "$MARKER_BASE")
+    binlog_inicio=$(echo "$coords_inicio" | awk '{print $1}')
 
-    # Forzamos rotación del binlog actual
     mysqladmin flush-logs 2>> "$ARCHIVO_LOG"
     local coords_actuales
     coords_actuales=$(ObtenerCoordenadasBinlog)
     local binlog_nuevo
     binlog_nuevo=$(echo "$coords_actuales" | awk '{print $1}')
 
-    # Identificamos todos los binlogs desde el inicio mensual hasta el recién cerrado
     local lista_logs=()
     local capturar=0
     while IFS= read -r log_line; do
         log_name=$(basename "$log_line")
         if [ "$log_name" == "$binlog_inicio" ]; then capturar=1; fi
         if [ "$log_name" == "$binlog_nuevo" ]; then break; fi
-        if [ $capturar -eq 1 ]; then
-            lista_logs+=("$log_name")
-        fi
+        if [ $capturar -eq 1 ]; then lista_logs+=("$log_name"); fi
     done < "$BINLOG_INDEX"
 
     if [ ${#lista_logs[@]} -eq 0 ]; then
@@ -190,23 +179,29 @@ BackupDiferencial() {
         return
     fi
 
-    # Empaquetamos los logs binarios
-    tar -cjf "$archivo" -C "$DIR_MYSQL" "${lista_logs[@]}" 2>> "$ARCHIVO_LOG"
+    # Creamos un archivo simple de metadata que viajará dentro del tar
+    local meta_file="$RUTA_TEMP/metadata.txt"
+    echo "TIPO=DIFERENCIAL" > "$meta_file"
+    echo "BASE_DESDE=$coords_inicio" >> "$meta_file"
+    echo "HASTA=$coords_actuales" >> "$meta_file"
+
+    tar -cjf "$archivo" -C "$DIR_MYSQL" "${lista_logs[@]}" -C "$RUTA_TEMP" metadata.txt 2>> "$ARCHIVO_LOG"
     local tar_status=$?
+    rm -f "$meta_file"
 
     if [ $tar_status -eq 0 ]; then
         echo "$coords_actuales" > "$MARKER_LAST"
-        RegistrarLog "Respaldo diferencial generado con ${#lista_logs[@]} binlogs ($archivo). Coordenadas: $coords_actuales"
+        RegistrarLog "Respaldo diferencial generado con ${#lista_logs[@]} binlogs ($archivo)."
         EnviarBackup "$archivo" "semanales"
     else
-        RegistrarLog "ERROR al empaquetar diferencial de logs binarios."
+        RegistrarLog "ERROR al empaquetar diferencial."
         rm -f "$archivo"
     fi
 }
 
 
 # ------------------------------------------------------------------------------
-# 3. RESPALDO INCREMENTAL DIARIO (Binlogs generados desde la última copia)
+# 3. INCREMENTAL DIARIO (Binlogs del día + metadata.txt empaquetado)
 # ------------------------------------------------------------------------------
 BackupIncremental() {
     local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-incremental-$FECHA.tar.bz2"
@@ -218,10 +213,11 @@ BackupIncremental() {
         return
     fi
 
+    local coords_inicio
+    coords_inicio=$(cat "$MARKER_LAST")
     local binlog_inicio
-    binlog_inicio=$(awk '{print $1}' "$MARKER_LAST")
+    binlog_inicio=$(echo "$coords_inicio" | awk '{print $1}')
 
-    # Cerramos el log de hoy para empaquetarlo
     mysqladmin flush-logs 2>> "$ARCHIVO_LOG"
     local coords_actuales
     coords_actuales=$(ObtenerCoordenadasBinlog)
@@ -234,9 +230,7 @@ BackupIncremental() {
         log_name=$(basename "$log_line")
         if [ "$log_name" == "$binlog_inicio" ]; then capturar=1; fi
         if [ "$log_name" == "$binlog_nuevo" ]; then break; fi
-        if [ $capturar -eq 1 ]; then
-            lista_logs+=("$log_name")
-        fi
+        if [ $capturar -eq 1 ]; then lista_logs+=("$log_name"); fi
     done < "$BINLOG_INDEX"
 
     if [ ${#lista_logs[@]} -eq 0 ]; then
@@ -244,15 +238,21 @@ BackupIncremental() {
         return
     fi
 
-    tar -cjf "$archivo" -C "$DIR_MYSQL" "${lista_logs[@]}" 2>> "$ARCHIVO_LOG"
+    local meta_file="$RUTA_TEMP/metadata.txt"
+    echo "TIPO=INCREMENTAL" > "$meta_file"
+    echo "DESDE=$coords_inicio" >> "$meta_file"
+    echo "HASTA=$coords_actuales" >> "$meta_file"
+
+    tar -cjf "$archivo" -C "$DIR_MYSQL" "${lista_logs[@]}" -C "$RUTA_TEMP" metadata.txt 2>> "$ARCHIVO_LOG"
     local tar_status=$?
+    rm -f "$meta_file"
 
     if [ $tar_status -eq 0 ]; then
         echo "$coords_actuales" > "$MARKER_LAST"
-        RegistrarLog "Respaldo incremental generado con ${#lista_logs[@]} binlogs ($archivo). Coordenadas: $coords_actuales"
+        RegistrarLog "Respaldo incremental generado con ${#lista_logs[@]} binlogs ($archivo)."
         EnviarBackup "$archivo" "diarios"
     else
-        RegistrarLog "ERROR al empaquetar incremental de logs binarios."
+        RegistrarLog "ERROR al empaquetar incremental."
         rm -f "$archivo"
     fi
 }
@@ -280,11 +280,6 @@ case "$1" in
         echo "        SiGeRU - Gestión de Respaldos MySQL (GFS)     "
         echo "======================================================="
         echo "Uso: $0 {incremental|diferencial|completo}"
-        echo
-        echo "Opciones:"
-        echo "  incremental  : Respaldo de binlogs del día (Nivel 2)"
-        echo "  diferencial  : Respaldo de binlogs acumulados del mes (Nivel 1)"
-        echo "  completo     : Respaldo total mysqldump + coordenadas (Nivel 0)"
         exit 1
         ;;
 esac
