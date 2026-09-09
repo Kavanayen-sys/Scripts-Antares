@@ -1,12 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# SiGeRU - Gestión de respaldos MySQL (Esquema GFS Real)
+# SiGeRU - Gestión de respaldos
 # Servidor de Base de Datos (192.168.1.11)
+# Esquema: Completo (Mensual) + Diferencial (Semanal) + Incremental (Diario)
 # ==============================================================================
 
 set -o pipefail
 
+# Configuración del servidor de backup
 SERVIDOR_BACKUP="192.168.1.12"
 USUARIO_BACKUP="respaldo"
 PUERTO_SSH="2026"
@@ -15,12 +17,14 @@ NOMBRE_BD="sigeru"
 DIR_MYSQL="/var/lib/mysql"
 BINLOG_INDEX="$DIR_MYSQL/binlog.index"
 
+# Rutas temporales y de control
 RUTA_TEMP="/var/backups/sigeru-mysql"
 DIR_CONTROL="/var/lib/sigeru-backup"
 MARKER_BASE="$DIR_CONTROL/mysql_base_coords.txt"
 MARKER_LAST="$DIR_CONTROL/mysql_last_coords.txt"
 ARCHIVO_LOG="/var/log/sigeru-backup-mysql.log"
 
+# Opciones SSH seguras para ejecución desatendida
 SSH_OPTS="-p $PUERTO_SSH -o BatchMode=yes -o ConnectTimeout=15"
 FECHA=$(date +"%Y-%m-%d_%H-%M-%S")
 
@@ -67,6 +71,7 @@ EnviarBackup() {
     tamano=$(du -h "$archivo" | cut -f1)
     RegistrarLog "Enviando respaldo ($tamano) al servidor $SERVIDOR_BACKUP en '$tipo'..."
 
+    # Transferencia con creación automática del directorio remoto si no existe
     rsync -avz \
         --rsync-path="mkdir -p /backups/mysql/$tipo && rsync" \
         -e "ssh $SSH_OPTS" \
@@ -95,7 +100,7 @@ EjecutarRotacion() {
         *) return ;;
     esac
 
-    RegistrarLog "Aplicando política de retención ($tipo: conservar $dias_retencion días)..."
+    RegistrarLog "Aplicando política de retención en servidor de backup ($tipo: conservar $dias_retencion días)..."
 
     ssh $SSH_OPTS "$USUARIO_BACKUP@$SERVIDOR_BACKUP" \
         "find /backups/mysql/$tipo/ -name 'mysql-*' -type f -mtime +$dias_retencion -delete" 2>/dev/null
@@ -109,7 +114,7 @@ EjecutarRotacion() {
 
 
 # ------------------------------------------------------------------------------
-# 1. COMPLETO MENSUAL (mysqldump base con coordenadas integradas)
+# 1. Respaldo Completo Mensual (Nivel 0 - Punto de referencia para todo el mes)
 # ------------------------------------------------------------------------------
 BackupCompleto() {
     local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-completo-$FECHA.sql.bz2"
@@ -118,21 +123,19 @@ BackupCompleto() {
     mysqldump \
         --single-transaction \
         --quick \
-        --flush-logs \
-        --source-data=2 \
         --routines \
         --triggers \
-        --events \
         --databases "$NOMBRE_BD" 2>> "$ARCHIVO_LOG" | bzip2 -c > "$archivo"
 
     local dump_status=$?
     if [ $dump_status -eq 0 ] && [ -s "$archivo" ]; then
+        mysqladmin flush-logs 2>> "$ARCHIVO_LOG"
         local coords
         coords=$(ObtenerCoordenadasBinlog)
         echo "$coords" > "$MARKER_BASE"
         echo "$coords" > "$MARKER_LAST"
 
-        RegistrarLog "Completo mensual generado ($archivo). Coordenadas: $coords"
+        RegistrarLog "Respaldo completo de MySQL generado exitosamente ($archivo). Coordenadas: $coords"
         EnviarBackup "$archivo" "mensuales"
     else
         RegistrarLog "ERROR: Falló mysqldump completo."
@@ -142,11 +145,11 @@ BackupCompleto() {
 
 
 # ------------------------------------------------------------------------------
-# 2. DIFERENCIAL SEMANAL (Binlogs acumulados + metadata.txt empaquetado)
+# 2. Respaldo Diferencial Semanal (Nivel 1 - Cambios desde el Completo Mensual)
 # ------------------------------------------------------------------------------
 BackupDiferencial() {
     local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-diferencial-$FECHA.tar.bz2"
-    RegistrarLog "Iniciando RESPALDO DIFERENCIAL SEMANAL (Binlogs acumulados)..."
+    RegistrarLog "Iniciando RESPALDO DIFERENCIAL SEMANAL de MySQL ($NOMBRE_BD)..."
 
     if [ ! -f "$MARKER_BASE" ]; then
         RegistrarLog "ADVERTENCIA: No existe punto de inicio mensual. Ejecutando respaldo completo primero."
@@ -179,7 +182,6 @@ BackupDiferencial() {
         return
     fi
 
-    # Creamos un archivo simple de metadata que viajará dentro del tar
     local meta_file="$RUTA_TEMP/metadata.txt"
     echo "TIPO=DIFERENCIAL" > "$meta_file"
     echo "BASE_DESDE=$coords_inicio" >> "$meta_file"
@@ -201,11 +203,11 @@ BackupDiferencial() {
 
 
 # ------------------------------------------------------------------------------
-# 3. INCREMENTAL DIARIO (Binlogs del día + metadata.txt empaquetado)
+# 3. Respaldo Incremental Diario (Nivel 2 - Cambios respecto al día anterior)
 # ------------------------------------------------------------------------------
 BackupIncremental() {
     local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-incremental-$FECHA.tar.bz2"
-    RegistrarLog "Iniciando RESPALDO INCREMENTAL DIARIO (Binlogs del día)..."
+    RegistrarLog "Iniciando RESPALDO INCREMENTAL DIARIO de MySQL ($NOMBRE_BD)..."
 
     if [ ! -f "$MARKER_LAST" ]; then
         RegistrarLog "ADVERTENCIA: No existe marcador previo. Ejecutando respaldo completo base."
@@ -277,9 +279,14 @@ case "$1" in
         ;;
     *)
         echo "======================================================="
-        echo "        SiGeRU - Gestión de Respaldos MySQL (GFS)     "
+        echo "        SiGeRU - Gestión de Respaldos de MySQL        "
         echo "======================================================="
         echo "Uso: $0 {incremental|diferencial|completo}"
+        echo
+        echo "Opciones:"
+        echo "  incremental  : Respaldo diario de cambios (Retención: 7 días)"
+        echo "  diferencial  : Respaldo semanal vs. base mensual (Retención: 4 semanas)"
+        echo "  completo     : Respaldo mensual base de referencia (Retención: 12 meses)"
         exit 1
         ;;
 esac
