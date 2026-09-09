@@ -3,11 +3,12 @@
 # ==============================================================================
 # SiGeRU - Sistema de Gestión de Residuos Urbanos
 # Grupo Antares - Script Modular de Administración del Servidor (Rocky Linux 10)
+# Versión: 1.2 (Validaciones estrictas y control de entrada)
 # ==============================================================================
 
 set -o pipefail
 
-# Paleta de colores para la interfaz de consola
+# Colores para la interfaz
 COLOR_RESET="\e[0m"
 COLOR_VERDE="\e[1;32m"
 COLOR_ROJO="\e[1;31m"
@@ -21,14 +22,14 @@ LOG_USUARIOS="/var/log/cre_usuarios.log"
 LOG_BACKUP_APP="/var/log/sigeru-backup.log"
 LOG_BACKUP_DB="/var/log/sigeru-backup-mysql.log"
 
-# Comprobación de privilegios de ejecución
+# Comprobación de root
 if [ "$EUID" -ne 0 ]; then
     echo -e "${COLOR_ROJO}ERROR: Este script debe ejecutarse con privilegios de root (sudo).${COLOR_RESET}" >&2
     exit 1
 fi
 
 # ==============================================================================
-# FUNCIONES AUXILIARES Y DE ENTRADA (Mantiene y mejora tu lógica de clase)
+# FUNCIONES DE VALIDACIÓN Y CONTROL DE ENTRADA
 # ==============================================================================
 
 RegistrarAccion() {
@@ -41,11 +42,54 @@ Pausar() {
     read -r
 }
 
-VerificarNumero() {
-    if [[ "$1" =~ ^[0-9]+$ ]]; then
-        echo -e "${COLOR_ROJO}Error: No se aceptan nombres puramente numéricos.${COLOR_RESET}"
+# Valida nombres de usuario bajo estándar POSIX Linux (sin caracteres raros/unicode)
+ValidarNombreUsuario() {
+    local usr="$1"
+    # Debe empezar con letra minúscula o guión bajo, contener solo letras, números, guión o guión bajo (máx 32 caracteres)
+    if [[ ! "$usr" =~ ^[a-z_][a-z0-9_-]{1,31}$ ]]; then
+        echo -e "${COLOR_ROJO}ERROR: Nombre de usuario inválido.${COLOR_RESET}"
+        echo -e "${COLOR_AMARILLO}Reglas: Solo letras minúsculas (a-z), números (0-9), guiones (-) y guiones bajos (_). No se admiten espacios, símbolos ni caracteres especiales.${COLOR_RESET}"
         return 1
     fi
+    return 0
+}
+
+# Valida formato IPv4 con máscara CIDR (ej: 192.168.1.10/24)
+ValidarIP_CIDR() {
+    local ip_cidr="$1"
+    local regex="^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$"
+    if [[ ! "$ip_cidr" =~ $regex ]]; then
+        echo -e "${COLOR_ROJO}ERROR: Formato de IP/Máscara inválido.${COLOR_RESET}"
+        echo -e "${COLOR_AMARILLO}Ejemplo correcto: 192.168.1.10/24${COLOR_RESET}"
+        return 1
+    fi
+    # Validar que los octetos estén entre 0 y 255
+    local ip=$(echo "$ip_cidr" | cut -d/ -f1)
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for octeto in "$o1" "$o2" "$o3" "$o4"; do
+        if ((octeto < 0 || octeto > 255)); then
+            echo -e "${COLOR_ROJO}ERROR: El octeto $octeto está fuera del rango permitido (0-255).${COLOR_RESET}"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Valida formato IPv4 simple (ej: 192.168.1.1)
+ValidarIP() {
+    local ip="$1"
+    local regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
+    if [[ ! "$ip" =~ $regex ]]; then
+        echo -e "${COLOR_ROJO}ERROR: Formato de IP inválido (Ejemplo: 192.168.1.1).${COLOR_RESET}"
+        return 1
+    fi
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for octeto in "$o1" "$o2" "$o3" "$o4"; do
+        if ((octeto < 0 || octeto > 255)); then
+            echo -e "${COLOR_ROJO}ERROR: El octeto $octeto está fuera de rango (0-255).${COLOR_RESET}"
+            return 1
+        fi
+    done
     return 0
 }
 
@@ -57,8 +101,9 @@ CargarUsuario() {
     case $opc_cargar in
         1)
             read -p "Nombre de usuario: " nombre_input
+            nombre_input=$(echo "$nombre_input" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
             if [ "$nombre_input" != "0" ] && [ -n "$nombre_input" ]; then
-                if VerificarNumero "$nombre_input"; then
+                if ValidarNombreUsuario "$nombre_input"; then
                     nombre="$nombre_input"
                 fi
             fi
@@ -66,18 +111,18 @@ CargarUsuario() {
         2)
             read -p "Ruta del archivo: " ruta_arch
             if [ -f "$ruta_arch" ]; then
-                nombre=$(awk '{print $1; exit}' "$ruta_arch")
-                echo -e "${COLOR_VERDE}Usuario '$nombre' cargado desde el archivo.${COLOR_RESET}"
+                local primer_usr
+                primer_usr=$(awk '{print $1; exit}' "$ruta_arch" | tr '[:upper:]' '[:lower:]' | tr -d '\r')
+                if ValidarNombreUsuario "$primer_usr"; then
+                    nombre="$primer_usr"
+                    echo -e "${COLOR_VERDE}Usuario '$nombre' cargado desde el archivo.${COLOR_RESET}"
+                fi
             else
                 echo -e "${COLOR_ROJO}El archivo no existe.${COLOR_RESET}"
             fi
             ;;
-        0)
-            echo "Operación cancelada."
-            ;;
-        *)
-            echo -e "${COLOR_ROJO}Opción inválida.${COLOR_RESET}"
-            ;;
+        0) echo "Operación cancelada." ;;
+        *) echo -e "${COLOR_ROJO}Opción inválida.${COLOR_RESET}" ;;
     esac
 }
 
@@ -95,7 +140,7 @@ ModuloUsuarios() {
         echo "2. Eliminar usuario"
         echo "3. Carga masiva de usuarios desde archivo"
         echo "4. Modificar cuenta (Bloquear / Desbloquear / Shell)"
-        echo "5. Listar usuarios del sistema (UID >= 1000)"
+        echo "5. Listar usuarios estándar del sistema (UID >= 1000)"
         echo "0. Volver al menú principal"
         echo -e "${COLOR_CYAN}-----------------------------------------------------${COLOR_RESET}"
         read -p "Seleccione una opción: " opc
@@ -108,12 +153,11 @@ ModuloUsuarios() {
                         echo -e "${COLOR_AMARILLO}El usuario '$nombre' ya existe.${COLOR_RESET}"
                     else
                         useradd -m -s /bin/bash "$nombre"
-                        # Política de clave: Inicial mayúscula + #123456
                         local pass_inicial="$(tr '[:lower:]' '[:upper:]' <<< ${nombre:0:1})#123456"
                         echo "$nombre:$pass_inicial" | chpasswd
-                        chage -d 0 "$nombre" # Fuerza cambio de clave en 1er login
+                        chage -d 0 "$nombre"
                         echo -e "${COLOR_VERDE}Usuario '$nombre' creado.${COLOR_RESET}"
-                        echo -e "Contraseña temporal asignada: ${COLOR_AMARILLO}$pass_inicial${COLOR_RESET}"
+                        echo -e "Contraseña temporal: ${COLOR_AMARILLO}$pass_inicial${COLOR_RESET}"
                         echo "$(date '+%Y-%m-%d %H:%M:%S') - Creado: $nombre" >> "$LOG_USUARIOS"
                         RegistrarAccion "Usuario creado: $nombre"
                     fi
@@ -142,8 +186,12 @@ ModuloUsuarios() {
                 read -p "Ruta del archivo de usuarios: " ruta_arch
                 if [ -f "$ruta_arch" ]; then
                     while IFS= read -r linea || [ -n "$linea" ]; do
-                        usr=$(echo "$linea" | awk '{print $1}' | tr -d '\r')
+                        usr=$(echo "$linea" | awk '{print $1}' | tr '[:upper:]' '[:lower:]' | tr -d '\r')
                         [ -z "$usr" ] && continue
+                        if ! ValidarNombreUsuario "$usr"; then
+                            echo -e "${COLOR_ROJO}[IGNORADO]${COLOR_RESET} '$usr' no cumple las reglas de nombre."
+                            continue
+                        fi
                         if id "$usr" &>/dev/null; then
                             echo -e "${COLOR_AMARILLO}[EXISTE]${COLOR_RESET} $usr"
                         else
@@ -164,12 +212,12 @@ ModuloUsuarios() {
             4)
                 read -p "Usuario a modificar: " nombre
                 if id "$nombre" &>/dev/null; then
-                    echo "a. Bloquear cuenta | b. Desbloquear cuenta | c. Establecer shell nologin"
+                    echo "a. Bloquear cuenta | b. Desbloquear cuenta | c. Establecer shell /sbin/nologin"
                     read -p "Opción: " subopc
                     case $subopc in
                         a) passwd -l "$nombre" && echo -e "${COLOR_VERDE}Cuenta bloqueada.${COLOR_RESET}" ;;
                         b) passwd -u "$nombre" && echo -e "${COLOR_VERDE}Cuenta desbloqueada.${COLOR_RESET}" ;;
-                        c) usermod -s /sbin/nologin "$nombre" && echo -e "${COLOR_VERDE}Shell modificado a /sbin/nologin.${COLOR_RESET}" ;;
+                        c) usermod -s /sbin/nologin "$nombre" && echo -e "${COLOR_VERDE}Shell modificado.${COLOR_RESET}" ;;
                         *) echo -e "${COLOR_ROJO}Opción inválida.${COLOR_RESET}" ;;
                     esac
                 else
@@ -210,8 +258,11 @@ ModuloGrupos() {
         case $opc in
             1)
                 read -p "Nombre del grupo: " grupo
+                grupo=$(echo "$grupo" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
                 if [ -n "$grupo" ] && [ "$grupo" != "0" ]; then
-                    if getent group "$grupo" &>/dev/null; then
+                    if ! ValidarNombreUsuario "$grupo"; then
+                        echo -e "${COLOR_ROJO}Nombre de grupo inválido.${COLOR_RESET}"
+                    elif getent group "$grupo" &>/dev/null; then
                         echo -e "${COLOR_AMARILLO}El grupo '$grupo' ya existe.${COLOR_RESET}"
                     else
                         groupadd "$grupo" && echo -e "${COLOR_VERDE}Grupo '$grupo' creado.${COLOR_RESET}"
@@ -276,56 +327,48 @@ ModuloRespaldos() {
         echo -e "${COLOR_CYAN}=====================================================${COLOR_RESET}"
         echo -e "${COLOR_CYAN}         SiGeRU - 3. GESTIÓN DE RESPALDOS           ${COLOR_RESET}"
         echo -e "${COLOR_CYAN}=====================================================${COLOR_RESET}"
-        echo "1. Ejecutar Respaldo Incremental Diario (App)"
-        echo "2. Ejecutar Respaldo Diferencial Semanal (App)"
-        echo "3. Ejecutar Respaldo Completo Mensual (App)"
-        echo "4. Ejecutar Respaldo de Base de Datos MySQL"
-        echo "5. Ver registros y estado de respaldos"
+        echo -e "${COLOR_AZUL}--- Servidor de Aplicaciones (192.168.1.10) ---${COLOR_RESET}"
+        echo "1. Respaldo Incremental Diario (App)"
+        echo "2. Respaldo Diferencial Semanal (App)"
+        echo "3. Respaldo Completo Mensual (App)"
+        echo
+        echo -e "${COLOR_AZUL}--- Servidor de Base de Datos (192.168.1.11) ---${COLOR_RESET}"
+        echo "4. Respaldo Incremental Diario (MySQL)"
+        echo "5. Respaldo Diferencial Semanal (MySQL)"
+        echo "6. Respaldo Completo Mensual (MySQL)"
+        echo
+        echo -e "${COLOR_AZUL}--- Auditoría y Logs ---${COLOR_RESET}"
+        echo "7. Ver registros de respaldos"
         echo "0. Volver al menú principal"
         echo -e "${COLOR_CYAN}-----------------------------------------------------${COLOR_RESET}"
         read -p "Seleccione una opción: " opc
 
         case $opc in
             1)
-                if [ -x "/usr/local/bin/backup-sigeru.sh" ]; then
-                    /usr/local/bin/backup-sigeru.sh incremental
-                else
-                    echo -e "${COLOR_ROJO}Script /usr/local/bin/backup-sigeru.sh no encontrado o sin permisos.${COLOR_RESET}"
-                fi
+                [ -x "/usr/local/bin/backup-sigeru.sh" ] && /usr/local/bin/backup-sigeru.sh incremental || echo -e "${COLOR_ROJO}No se encontró /usr/local/bin/backup-sigeru.sh${COLOR_RESET}"
                 Pausar
                 ;;
             2)
-                if [ -x "/usr/local/bin/backup-sigeru.sh" ]; then
-                    /usr/local/bin/backup-sigeru.sh diferencial
-                else
-                    echo -e "${COLOR_ROJO}Script /usr/local/bin/backup-sigeru.sh no encontrado.${COLOR_RESET}"
-                fi
+                [ -x "/usr/local/bin/backup-sigeru.sh" ] && /usr/local/bin/backup-sigeru.sh diferencial || echo -e "${COLOR_ROJO}No se encontró /usr/local/bin/backup-sigeru.sh${COLOR_RESET}"
                 Pausar
                 ;;
             3)
-                if [ -x "/usr/local/bin/backup-sigeru.sh" ]; then
-                    /usr/local/bin/backup-sigeru.sh completo
-                else
-                    echo -e "${COLOR_ROJO}Script /usr/local/bin/backup-sigeru.sh no encontrado.${COLOR_RESET}"
-                fi
+                [ -x "/usr/local/bin/backup-sigeru.sh" ] && /usr/local/bin/backup-sigeru.sh completo || echo -e "${COLOR_ROJO}No se encontró /usr/local/bin/backup-sigeru.sh${COLOR_RESET}"
                 Pausar
                 ;;
             4)
-                if [ -x "/usr/local/bin/backup-mysql.sh" ]; then
-                    echo "a. Incremental Diario | b. Diferencial Semanal | c. Completo Mensual"
-                    read -p "Tipo de respaldo MySQL: " subopc
-                    case $subopc in
-                        a) /usr/local/bin/backup-mysql.sh incremental ;;
-                        b) /usr/local/bin/backup-mysql.sh diferencial ;;
-                        c) /usr/local/bin/backup-mysql.sh completo ;;
-                        *) echo -e "${COLOR_ROJO}Opción inválida.${COLOR_RESET}" ;;
-                    esac
-                else
-                    echo -e "${COLOR_ROJO}Script /usr/local/bin/backup-mysql.sh no encontrado.${COLOR_RESET}"
-                fi
+                [ -x "/usr/local/bin/backup-mysql.sh" ] && /usr/local/bin/backup-mysql.sh incremental || echo -e "${COLOR_ROJO}No se encontró /usr/local/bin/backup-mysql.sh${COLOR_RESET}"
                 Pausar
                 ;;
             5)
+                [ -x "/usr/local/bin/backup-mysql.sh" ] && /usr/local/bin/backup-mysql.sh diferencial || echo -e "${COLOR_ROJO}No se encontró /usr/local/bin/backup-mysql.sh${COLOR_RESET}"
+                Pausar
+                ;;
+            6)
+                [ -x "/usr/local/bin/backup-mysql.sh" ] && /usr/local/bin/backup-mysql.sh completo || echo -e "${COLOR_ROJO}No se encontró /usr/local/bin/backup-mysql.sh${COLOR_RESET}"
+                Pausar
+                ;;
+            7)
                 echo -e "${COLOR_AZUL}--- Logs de Respaldo de Aplicación ---${COLOR_RESET}"
                 [ -f "$LOG_BACKUP_APP" ] && tail -n 10 "$LOG_BACKUP_APP" || echo "Sin registros."
                 echo -e "\n${COLOR_AZUL}--- Logs de Respaldo de MySQL ---${COLOR_RESET}"
@@ -350,7 +393,7 @@ ModuloRedes() {
         echo -e "${COLOR_CYAN}=====================================================${COLOR_RESET}"
         echo "1. Ver estado de interfaces y direcciones IP"
         echo "2. Configurar IP estática (nmcli)"
-        echo "3. Configurar interfaz en modo DHCP"
+        echo "3. Configurar interfaz en modo DHCP (Modo Mantenimiento/Internet)"
         echo "4. Probar conectividad con servidores (Ping)"
         echo "5. Reiniciar conexión de red"
         echo "0. Volver al menú principal"
@@ -367,38 +410,57 @@ ModuloRedes() {
                 ;;
             2)
                 read -p "Interfaz de red (ej: enp0s3): " iface
+                if ! nmcli device status | grep -qw "$iface"; then
+                    echo -e "${COLOR_ROJO}ERROR: La interfaz '$iface' no existe en este servidor.${COLOR_RESET}"
+                    Pausar; continue
+                fi
+
                 read -p "Dirección IP y máscara (ej: 192.168.1.10/24): " ip_cidr
+                if ! ValidarIP_CIDR "$ip_cidr"; then Pausar; continue; fi
+
                 read -p "Puerta de enlace (Gateway, ej: 192.168.1.1): " gw
+                if ! ValidarIP "$gw"; then Pausar; continue; fi
+
                 read -p "Servidores DNS (ej: 8.8.8.8,1.1.1.1): " dns
 
-                nmcli connection modify "$iface" ipv4.method manual
-                nmcli connection modify "$iface" ipv4.addresses "$ip_cidr"
-                nmcli connection modify "$iface" ipv4.gateway "$gw"
-                nmcli connection modify "$iface" ipv4.dns "$dns"
-                nmcli connection down "$iface" && nmcli connection up "$iface"
-                echo -e "${COLOR_VERDE}IP estática configurada en $iface.${COLOR_RESET}"
-                RegistrarAccion "Red estática configurada en $iface ($ip_cidr)"
+                # Aplicar cambios y verificar retorno real de nmcli
+                if nmcli connection modify "$iface" ipv4.method manual \
+                    ipv4.addresses "$ip_cidr" \
+                    ipv4.gateway "$gw" \
+                    ipv4.dns "$dns" && \
+                   nmcli connection down "$iface" && nmcli connection up "$iface"; then
+                    echo -e "${COLOR_VERDE}IP estática ($ip_cidr) configurada con éxito en $iface.${COLOR_RESET}"
+                    RegistrarAccion "Red estática configurada en $iface: $ip_cidr"
+                else
+                    echo -e "${COLOR_ROJO}ERROR: Falló la configuración de red con NetworkManager.${COLOR_RESET}"
+                fi
                 Pausar
                 ;;
             3)
                 read -p "Interfaz a configurar en DHCP (ej: enp0s3): " iface
-                nmcli connection modify "$iface" ipv4.method auto
-                nmcli connection down "$iface" && nmcli connection up "$iface"
-                echo -e "${COLOR_VERDE}Interfaz $iface configurada en DHCP.${COLOR_RESET}"
-                RegistrarAccion "Interfaz $iface cambiada a DHCP"
+                if nmcli connection modify "$iface" ipv4.method auto && \
+                   nmcli connection down "$iface" && nmcli connection up "$iface"; then
+                    echo -e "${COLOR_VERDE}Interfaz $iface configurada en DHCP exitosamente.${COLOR_RESET}"
+                    RegistrarAccion "Interfaz $iface cambiada a DHCP"
+                else
+                    echo -e "${COLOR_ROJO}ERROR al cambiar a DHCP.${COLOR_RESET}"
+                fi
                 Pausar
                 ;;
             4)
                 echo "1. Servidor Web (192.168.1.10)"
                 echo "2. Servidor BD (192.168.1.11)"
                 echo "3. Servidor Respaldos (192.168.1.12)"
-                echo "4. Gateway (192.168.1.1)"
+                echo "4. Gateway (192.168.1.1) [Nota: No responde en Red Interna]"
                 read -p "Destino a probar: " p_opc
                 case $p_opc in
                     1) ping -c 3 192.168.1.10 ;;
                     2) ping -c 3 192.168.1.11 ;;
                     3) ping -c 3 192.168.1.12 ;;
-                    4) ping -c 3 192.168.1.1 ;;
+                    4) 
+                        echo -e "${COLOR_AMARILLO}En Red Interna aislada de VirtualBox no existe un router en .1, por lo que puede dar 100% de pérdida:${COLOR_RESET}"
+                        ping -c 3 192.168.1.1 
+                        ;;
                     *) echo -e "${COLOR_ROJO}Opción inválida.${COLOR_RESET}" ;;
                 esac
                 Pausar
@@ -461,7 +523,7 @@ ModuloBaseDatos() {
                   );
                 "
                 if [ $? -eq 0 ]; then
-                    echo -e "${COLOR_VERDE}Base de datos 'sigeru' y tabla 'usuarios' listas.${COLOR_RESET}"
+                    echo -e "${COLOR_VERDE}Base de datos 'sigeru' y tabla 'usuarios' verificadas con éxito.${COLOR_RESET}"
                     RegistrarAccion "Base de datos sigeru verificada/inicializada"
                 else
                     echo -e "${COLOR_ROJO}Error al conectar con MySQL. Verifique /root/.my.cnf.${COLOR_RESET}"
@@ -510,18 +572,26 @@ ModuloFirewall() {
                 ;;
             2)
                 read -p "Puerto y protocolo (ej: 2026/tcp): " pto
-                firewall-cmd --permanent --zone=public --add-port="$pto"
-                firewall-cmd --reload
-                echo -e "${COLOR_VERDE}Puerto $pto abierto.${COLOR_RESET}"
-                RegistrarAccion "Firewall: Puerto $pto abierto"
+                if [[ "$pto" =~ ^[0-9]+/(tcp|udp)$ ]]; then
+                    firewall-cmd --permanent --zone=public --add-port="$pto" && \
+                    firewall-cmd --reload && \
+                    echo -e "${COLOR_VERDE}Puerto $pto abierto.${COLOR_RESET}"
+                    RegistrarAccion "Firewall: Puerto $pto abierto"
+                else
+                    echo -e "${COLOR_ROJO}Formato inválido. Ejemplo: 2026/tcp${COLOR_RESET}"
+                fi
                 Pausar
                 ;;
             3)
                 read -p "Puerto y protocolo a cerrar (ej: 22/tcp): " pto
-                firewall-cmd --permanent --zone=public --remove-port="$pto"
-                firewall-cmd --reload
-                echo -e "${COLOR_VERDE}Puerto $pto cerrado.${COLOR_RESET}"
-                RegistrarAccion "Firewall: Puerto $pto cerrado"
+                if [[ "$pto" =~ ^[0-9]+/(tcp|udp)$ ]]; then
+                    firewall-cmd --permanent --zone=public --remove-port="$pto" && \
+                    firewall-cmd --reload && \
+                    echo -e "${COLOR_VERDE}Puerto $pto cerrado.${COLOR_RESET}"
+                    RegistrarAccion "Firewall: Puerto $pto cerrado"
+                else
+                    echo -e "${COLOR_ROJO}Formato inválido. Ejemplo: 22/tcp${COLOR_RESET}"
+                fi
                 Pausar
                 ;;
             4)
@@ -642,18 +712,32 @@ MenuPrincipal() {
 }
 
 # ==============================================================================
-# CONTROL DE FLUJO (INTERACTIVO O ARGUMENTOS DE LÍNEA DE COMANDOS)
+# CONTROL DE FLUJO (INTERACTIVO O LÍNEA DE COMANDOS)
 # ==============================================================================
 
-# Si se ejecuta sin parámetros, entra al menú interactivo
 if [ $# -eq 0 ]; then
     RegistrarAccion "Sesión interactiva iniciada"
     MenuPrincipal
 
-# Modo compatible con parámetros rápidos: $0 <usuario> [archivo]
 elif [ $# -eq 2 ] && [ "$2" == "archivo" ]; then
     if [ -f "$1" ]; then
-        nombre=$(awk '{print $1; exit}' "$1")
+        nombre=$(awk '{print $1; exit}' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '\r')
+        if ValidarNombreUsuario "$nombre"; then
+            if id "$nombre" &>/dev/null; then
+                userdel -r "$nombre"
+                echo "Usuario '$nombre' eliminado."
+            else
+                useradd -m -s /bin/bash "$nombre"
+                echo "$nombre:$(tr '[:lower:]' '[:upper:]' <<< ${nombre:0:1})#123456" | chpasswd
+                chage -d 0 "$nombre"
+                echo "Usuario '$nombre' creado."
+            fi
+        fi
+    fi
+
+elif [ $# -eq 1 ]; then
+    nombre=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    if ValidarNombreUsuario "$nombre"; then
         if id "$nombre" &>/dev/null; then
             userdel -r "$nombre"
             echo "Usuario '$nombre' eliminado."
@@ -663,18 +747,5 @@ elif [ $# -eq 2 ] && [ "$2" == "archivo" ]; then
             chage -d 0 "$nombre"
             echo "Usuario '$nombre' creado."
         fi
-    fi
-
-elif [ $# -eq 1 ]; then
-    VerificarNumero "$1"
-    nombre="$1"
-    if id "$nombre" &>/dev/null; then
-        userdel -r "$nombre"
-        echo "Usuario '$nombre' eliminado."
-    else
-        useradd -m -s /bin/bash "$nombre"
-        echo "$nombre:$(tr '[:lower:]' '[:upper:]' <<< ${nombre:0:1})#123456" | chpasswd
-        chage -d 0 "$nombre"
-        echo "Usuario '$nombre' creado."
     fi
 fi
