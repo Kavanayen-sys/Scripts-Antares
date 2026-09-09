@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # ==============================================================================
-# SiGeRU - Gestión de respaldos
+# SiGeRU - Gestión de respaldos REALES de Base de Datos
 # Servidor de Base de Datos (192.168.1.11)
-# Esquema: Completo (Mensual) + Diferencial (Semanal) + Incremental (Diario)
+# Esquema: Completo (mysqldump) + Diferencial (Binlogs acumulados) + Incremental (Binlog diario)
 # ==============================================================================
 
 # Configuración del servidor de backup
@@ -11,15 +11,17 @@ SERVIDOR_BACKUP="192.168.1.12"
 USUARIO_BACKUP="respaldo"
 PUERTO_SSH="2026"
 
-# Parámetros de Base de Datos
-# NOTA: Se utiliza /root/.my.cnf con permisos 600 para autenticación desatendida.
 NOMBRE_BD="sigeru"
+DIR_MYSQL="/var/lib/mysql"
+BINLOG_INDEX="$DIR_MYSQL/binlog.index"
 
-# Rutas temporales y de logs
+# Rutas de control y temporales
 RUTA_TEMP="/var/backups/sigeru-mysql"
+DIR_CONTROL="/var/lib/sigeru-backup"
+MARKER_BASE="$DIR_CONTROL/mysql_base_binlog.txt"
+MARKER_LAST="$DIR_CONTROL/mysql_last_binlog.txt"
 ARCHIVO_LOG="/var/log/sigeru-backup-mysql.log"
 
-# Opciones SSH seguras para ejecución desatendida
 SSH_OPTS="-p $PUERTO_SSH -o BatchMode=yes -o ConnectTimeout=15"
 FECHA=$(date +"%Y-%m-%d_%H-%M-%S")
 
@@ -39,7 +41,14 @@ ValidarPermisos() {
 
 PrepararDirectorios() {
     mkdir -p "$RUTA_TEMP"
+    mkdir -p "$DIR_CONTROL"
     mkdir -p "$(dirname "$ARCHIVO_LOG")"
+}
+
+
+# Obtener el nombre del binlog activo actual
+ObtenerBinlogActual() {
+    mysql -N -e "SHOW MASTER STATUS;" 2>/dev/null | awk '{print $1}'
 }
 
 
@@ -54,9 +63,8 @@ EnviarBackup() {
 
     local tamano
     tamano=$(du -h "$archivo" | cut -f1)
-    RegistrarLog "Enviando respaldo MySQL ($tamano) al servidor $SERVIDOR_BACKUP en '$tipo'..."
+    RegistrarLog "Enviando respaldo ($tamano) al servidor $SERVIDOR_BACKUP en '$tipo'..."
 
-    # Transferencia con creación automática del directorio destino en el servidor de backup
     rsync -avz \
         --rsync-path="mkdir -p /backups/mysql/$tipo && rsync" \
         -e "ssh $SSH_OPTS" \
@@ -85,10 +93,10 @@ EjecutarRotacion() {
         *) return ;;
     esac
 
-    RegistrarLog "Aplicando política de retención en servidor de backup (MySQL $tipo: conservar $dias_retencion días)..."
+    RegistrarLog "Aplicando política de retención ($tipo: conservar $dias_retencion días)..."
 
     ssh $SSH_OPTS "$USUARIO_BACKUP@$SERVIDOR_BACKUP" \
-        "find /backups/mysql/$tipo/ -name '*.sql.bz2' -type f -mtime +$dias_retencion -delete" 2>/dev/null
+        "find /backups/mysql/$tipo/ -name 'mysql-*' -type f -mtime +$dias_retencion -delete" 2>/dev/null
 
     if [ $? -eq 0 ]; then
         RegistrarLog "Rotación de respaldos MySQL $tipo completada."
@@ -99,15 +107,17 @@ EjecutarRotacion() {
 
 
 # ------------------------------------------------------------------------------
-# 1. Respaldo Completo Mensual (Nivel 0 - Punto de referencia anual/mensual)
+# 1. RESPALDO COMPLETO MENSUAL (Dump lógico base + rotación de log)
 # ------------------------------------------------------------------------------
 BackupCompleto() {
     local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-completo-$FECHA.sql.bz2"
-    RegistrarLog "Iniciando RESPALDO COMPLETO MENSUAL de MySQL ($NOMBRE_BD)..."
+    RegistrarLog "Iniciando RESPALDO COMPLETO MENSUAL (mysqldump base)..."
 
+    # mysqldump con --flush-logs cierra el binlog anterior e inicia uno nuevo limpio
     mysqldump \
         --single-transaction \
         --quick \
+        --flush-logs \
         --routines \
         --triggers \
         --events \
@@ -115,62 +125,116 @@ BackupCompleto() {
 
     local dump_status=$?
     if [ $dump_status -eq 0 ] && [ -s "$archivo" ]; then
-        RegistrarLog "Respaldo completo de MySQL generado exitosamente ($archivo)."
+        # Guardamos el nuevo binlog activo como punto cero del mes
+        local binlog_actual
+        binlog_actual=$(ObtenerBinlogActual)
+        echo "$binlog_actual" > "$MARKER_BASE"
+        echo "$binlog_actual" > "$MARKER_LAST"
+
+        RegistrarLog "Completo mensual generado ($archivo). Punto de inicio binlog: $binlog_actual"
         EnviarBackup "$archivo" "mensuales"
     else
-        RegistrarLog "ERROR: Falló mysqldump al generar el respaldo completo."
+        RegistrarLog "ERROR: Falló mysqldump completo."
         rm -f "$archivo"
     fi
 }
 
 
 # ------------------------------------------------------------------------------
-# 2. Respaldo Diferencial Semanal (Nivel 1 - Puntos de control semanales)
+# 2. RESPALDO DIFERENCIAL SEMANAL (Todos los binlogs desde el Completo Mensual)
 # ------------------------------------------------------------------------------
 BackupDiferencial() {
-    local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-diferencial-$FECHA.sql.bz2"
-    RegistrarLog "Iniciando RESPALDO DIFERENCIAL SEMANAL de MySQL ($NOMBRE_BD)..."
+    local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-diferencial-$FECHA.tar.bz2"
+    RegistrarLog "Iniciando RESPALDO DIFERENCIAL SEMANAL (Binlogs acumulados del mes)..."
 
-    mysqldump \
-        --single-transaction \
-        --quick \
-        --routines \
-        --triggers \
-        --events \
-        --databases "$NOMBRE_BD" 2>> "$ARCHIVO_LOG" | bzip2 -c > "$archivo"
+    if [ ! -f "$MARKER_BASE" ]; then
+        RegistrarLog "ADVERTENCIA: No existe punto de inicio mensual. Ejecutando respaldo completo primero."
+        BackupCompleto
+        return
+    fi
 
-    local dump_status=$?
-    if [ $dump_status -eq 0 ] && [ -s "$archivo" ]; then
-        RegistrarLog "Respaldo diferencial de MySQL generado exitosamente ($archivo)."
+    local binlog_inicio
+    binlog_inicio=$(cat "$MARKER_BASE")
+
+    # Forzamos cierre del binlog actual para poder empaquetar datos consistentes
+    mysqladmin flush-logs 2>> "$ARCHIVO_LOG"
+    local binlog_nuevo
+    binlog_nuevo=$(ObtenerBinlogActual)
+
+    # Identificamos todos los binlogs desde el inicio mensual hasta el recién cerrado
+    local lista_logs=()
+    local capturar=0
+    while IFS= read -r log_line; do
+        log_name=$(basename "$log_line")
+        if [ "$log_name" == "$binlog_inicio" ]; then capturar=1; fi
+        if [ "$log_name" == "$binlog_nuevo" ]; then break; fi
+        if [ $capturar -eq 1 ]; then
+            lista_logs+=("$log_name")
+        fi
+    done < "$BINLOG_INDEX"
+
+    if [ ${#lista_logs[@]} -eq 0 ]; then
+        RegistrarLog "Sin cambios acumulados desde el respaldo completo."
+        return
+    fi
+
+    # Empaquetamos los logs binarios acumulados
+    tar -cjf "$archivo" -C "$DIR_MYSQL" "${lista_logs[@]}" 2>> "$ARCHIVO_LOG"
+    if [ $? -eq 0 ]; then
+        echo "$binlog_nuevo" > "$MARKER_LAST"
+        RegistrarLog "Respaldo diferencial generado con ${#lista_logs[@]} logs binarios ($archivo)."
         EnviarBackup "$archivo" "semanales"
     else
-        RegistrarLog "ERROR: Falló mysqldump al generar el respaldo diferencial."
+        RegistrarLog "ERROR al empaquetar diferencial de logs binarios."
         rm -f "$archivo"
     fi
 }
 
 
 # ------------------------------------------------------------------------------
-# 3. Respaldo Incremental Diario (Nivel 2 - Copia diaria frecuente)
+# 3. RESPALDO INCREMENTAL DIARIO (Solo los binlogs generados desde ayer)
 # ------------------------------------------------------------------------------
 BackupIncremental() {
-    local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-incremental-$FECHA.sql.bz2"
-    RegistrarLog "Iniciando RESPALDO INCREMENTAL DIARIO de MySQL ($NOMBRE_BD)..."
+    local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-incremental-$FECHA.tar.bz2"
+    RegistrarLog "Iniciando RESPALDO INCREMENTAL DIARIO (Binlogs del día)..."
 
-    mysqldump \
-        --single-transaction \
-        --quick \
-        --routines \
-        --triggers \
-        --events \
-        --databases "$NOMBRE_BD" 2>> "$ARCHIVO_LOG" | bzip2 -c > "$archivo"
+    if [ ! -f "$MARKER_LAST" ]; then
+        RegistrarLog "ADVERTENCIA: No existe marcador previo. Ejecutando respaldo completo base."
+        BackupCompleto
+        return
+    fi
 
-    local dump_status=$?
-    if [ $dump_status -eq 0 ] && [ -s "$archivo" ]; then
-        RegistrarLog "Respaldo incremental de MySQL generado exitosamente ($archivo)."
+    local binlog_inicio
+    binlog_inicio=$(cat "$MARKER_LAST")
+
+    # Cerramos el log de hoy para empaquetarlo
+    mysqladmin flush-logs 2>> "$ARCHIVO_LOG"
+    local binlog_nuevo
+    binlog_nuevo=$(ObtenerBinlogActual)
+
+    local lista_logs=()
+    local capturar=0
+    while IFS= read -r log_line; do
+        log_name=$(basename "$log_line")
+        if [ "$log_name" == "$binlog_inicio" ]; then capturar=1; fi
+        if [ "$log_name" == "$binlog_nuevo" ]; then break; fi
+        if [ $capturar -eq 1 ]; then
+            lista_logs+=("$log_name")
+        fi
+    done < "$BINLOG_INDEX"
+
+    if [ ${#lista_logs[@]} -eq 0 ]; then
+        RegistrarLog "Sin transacciones nuevas para respaldar hoy."
+        return
+    fi
+
+    tar -cjf "$archivo" -C "$DIR_MYSQL" "${lista_logs[@]}" 2>> "$ARCHIVO_LOG"
+    if [ $? -eq 0 ]; then
+        echo "$binlog_nuevo" > "$MARKER_LAST"
+        RegistrarLog "Respaldo incremental generado con ${#lista_logs[@]} binlogs ($archivo)."
         EnviarBackup "$archivo" "diarios"
     else
-        RegistrarLog "ERROR: Falló mysqldump al generar el respaldo incremental."
+        RegistrarLog "ERROR al empaquetar incremental de logs binarios."
         rm -f "$archivo"
     fi
 }
@@ -195,14 +259,14 @@ case "$1" in
         ;;
     *)
         echo "======================================================="
-        echo "        SiGeRU - Gestión de Respaldos de MySQL        "
+        echo "        SiGeRU - Gestión de Respaldos MySQL (GFS)     "
         echo "======================================================="
         echo "Uso: $0 {incremental|diferencial|completo}"
         echo
         echo "Opciones:"
-        echo "  incremental  : Respaldo diario de MySQL (Retención: 7 días)"
-        echo "  diferencial  : Respaldo semanal de MySQL (Retención: 4 semanas)"
-        echo "  completo     : Respaldo mensual de referencia (Retención: 12 meses)"
+        echo "  incremental  : Respaldo de transacciones del día (Binlogs diarios)"
+        echo "  diferencial  : Respaldo acumulado del mes (Binlogs acumulados)"
+        echo "  completo     : Respaldo lógico total de la base (mysqldump base)"
         exit 1
         ;;
 esac
