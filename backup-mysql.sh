@@ -1,10 +1,13 @@
 #!/bin/bash
 
 # ==============================================================================
-# SiGeRU - Gestión de respaldos REALES de Base de Datos
+# SiGeRU - Gestión de respaldos REALES de Base de Datos (GFS)
 # Servidor de Base de Datos (192.168.1.11)
-# Esquema: Completo (mysqldump) + Diferencial (Binlogs acumulados) + Incremental (Binlog diario)
+# Esquema: Completo (mysqldump + coordenadas) + Diferencial (Binlogs) + Incremental (Binlogs)
 # ==============================================================================
+
+# Atrapa errores reales dentro de cualquier tubería (|)
+set -o pipefail
 
 # Configuración del servidor de backup
 SERVIDOR_BACKUP="192.168.1.12"
@@ -18,8 +21,8 @@ BINLOG_INDEX="$DIR_MYSQL/binlog.index"
 # Rutas de control y temporales
 RUTA_TEMP="/var/backups/sigeru-mysql"
 DIR_CONTROL="/var/lib/sigeru-backup"
-MARKER_BASE="$DIR_CONTROL/mysql_base_binlog.txt"
-MARKER_LAST="$DIR_CONTROL/mysql_last_binlog.txt"
+MARKER_BASE="$DIR_CONTROL/mysql_base_coords.txt"
+MARKER_LAST="$DIR_CONTROL/mysql_last_coords.txt"
 ARCHIVO_LOG="/var/log/sigeru-backup-mysql.log"
 
 SSH_OPTS="-p $PUERTO_SSH -o BatchMode=yes -o ConnectTimeout=15"
@@ -46,9 +49,14 @@ PrepararDirectorios() {
 }
 
 
-# Obtener el nombre del binlog activo actual
-ObtenerBinlogActual() {
-    mysql -N -e "SHOW MASTER STATUS;" 2>/dev/null | awk '{print $1}'
+# Obtiene tanto el archivo como la posición exacta en bytes
+ObtenerCoordenadasBinlog() {
+    # Compatible con MySQL 8.4 (SHOW BINARY LOG STATUS) y versiones previas (SHOW MASTER STATUS)
+    local status
+    status=$(mysql -N -e "SHOW BINARY LOG STATUS;" 2>/dev/null || mysql -N -e "SHOW MASTER STATUS;" 2>/dev/null)
+    local arch=$(echo "$status" | awk '{print $1}')
+    local pos=$(echo "$status" | awk '{print $2}')
+    echo "$arch $pos"
 }
 
 
@@ -107,17 +115,19 @@ EjecutarRotacion() {
 
 
 # ------------------------------------------------------------------------------
-# 1. RESPALDO COMPLETO MENSUAL (Dump lógico base + rotación de log)
+# 1. RESPALDO COMPLETO MENSUAL (Dump lógico base + Coordenadas exactas)
 # ------------------------------------------------------------------------------
 BackupCompleto() {
     local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-completo-$FECHA.sql.bz2"
-    RegistrarLog "Iniciando RESPALDO COMPLETO MENSUAL (mysqldump base)..."
+    RegistrarLog "Iniciando RESPALDO COMPLETO MENSUAL (mysqldump base con coordenadas)..."
 
-    # mysqldump con --flush-logs cierra el binlog anterior e inicia uno nuevo limpio
+    # --source-data=2 (o --master-data=2) graba las coordenadas dentro del propio .sql
+    # --flush-logs inicia un binlog nuevo limpio
     mysqldump \
         --single-transaction \
         --quick \
         --flush-logs \
+        --source-data=2 \
         --routines \
         --triggers \
         --events \
@@ -125,23 +135,23 @@ BackupCompleto() {
 
     local dump_status=$?
     if [ $dump_status -eq 0 ] && [ -s "$archivo" ]; then
-        # Guardamos el nuevo binlog activo como punto cero del mes
-        local binlog_actual
-        binlog_actual=$(ObtenerBinlogActual)
-        echo "$binlog_actual" > "$MARKER_BASE"
-        echo "$binlog_actual" > "$MARKER_LAST"
+        # Guardamos Archivo y Posición exacta (Punto Cero del mes)
+        local coords
+        coords=$(ObtenerCoordenadasBinlog)
+        echo "$coords" > "$MARKER_BASE"
+        echo "$coords" > "$MARKER_LAST"
 
-        RegistrarLog "Completo mensual generado ($archivo). Punto de inicio binlog: $binlog_actual"
+        RegistrarLog "Completo mensual generado ($archivo). Punto base: $coords"
         EnviarBackup "$archivo" "mensuales"
     else
-        RegistrarLog "ERROR: Falló mysqldump completo."
+        RegistrarLog "ERROR: Falló mysqldump completo (Código de error: $dump_status)."
         rm -f "$archivo"
     fi
 }
 
 
 # ------------------------------------------------------------------------------
-# 2. RESPALDO DIFERENCIAL SEMANAL (Todos los binlogs desde el Completo Mensual)
+# 2. RESPALDO DIFERENCIAL SEMANAL (Binlogs acumulados desde el Completo Mensual)
 # ------------------------------------------------------------------------------
 BackupDiferencial() {
     local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-diferencial-$FECHA.tar.bz2"
@@ -154,12 +164,14 @@ BackupDiferencial() {
     fi
 
     local binlog_inicio
-    binlog_inicio=$(cat "$MARKER_BASE")
+    binlog_inicio=$(awk '{print $1}' "$MARKER_BASE")
 
-    # Forzamos cierre del binlog actual para poder empaquetar datos consistentes
+    # Forzamos rotación del binlog actual
     mysqladmin flush-logs 2>> "$ARCHIVO_LOG"
+    local coords_actuales
+    coords_actuales=$(ObtenerCoordenadasBinlog)
     local binlog_nuevo
-    binlog_nuevo=$(ObtenerBinlogActual)
+    binlog_nuevo=$(echo "$coords_actuales" | awk '{print $1}')
 
     # Identificamos todos los binlogs desde el inicio mensual hasta el recién cerrado
     local lista_logs=()
@@ -178,11 +190,13 @@ BackupDiferencial() {
         return
     fi
 
-    # Empaquetamos los logs binarios acumulados
+    # Empaquetamos los logs binarios
     tar -cjf "$archivo" -C "$DIR_MYSQL" "${lista_logs[@]}" 2>> "$ARCHIVO_LOG"
-    if [ $? -eq 0 ]; then
-        echo "$binlog_nuevo" > "$MARKER_LAST"
-        RegistrarLog "Respaldo diferencial generado con ${#lista_logs[@]} logs binarios ($archivo)."
+    local tar_status=$?
+
+    if [ $tar_status -eq 0 ]; then
+        echo "$coords_actuales" > "$MARKER_LAST"
+        RegistrarLog "Respaldo diferencial generado con ${#lista_logs[@]} binlogs ($archivo). Coordenadas: $coords_actuales"
         EnviarBackup "$archivo" "semanales"
     else
         RegistrarLog "ERROR al empaquetar diferencial de logs binarios."
@@ -192,7 +206,7 @@ BackupDiferencial() {
 
 
 # ------------------------------------------------------------------------------
-# 3. RESPALDO INCREMENTAL DIARIO (Solo los binlogs generados desde ayer)
+# 3. RESPALDO INCREMENTAL DIARIO (Binlogs generados desde la última copia)
 # ------------------------------------------------------------------------------
 BackupIncremental() {
     local archivo="$RUTA_TEMP/mysql-$NOMBRE_BD-incremental-$FECHA.tar.bz2"
@@ -205,12 +219,14 @@ BackupIncremental() {
     fi
 
     local binlog_inicio
-    binlog_inicio=$(cat "$MARKER_LAST")
+    binlog_inicio=$(awk '{print $1}' "$MARKER_LAST")
 
     # Cerramos el log de hoy para empaquetarlo
     mysqladmin flush-logs 2>> "$ARCHIVO_LOG"
+    local coords_actuales
+    coords_actuales=$(ObtenerCoordenadasBinlog)
     local binlog_nuevo
-    binlog_nuevo=$(ObtenerBinlogActual)
+    binlog_nuevo=$(echo "$coords_actuales" | awk '{print $1}')
 
     local lista_logs=()
     local capturar=0
@@ -229,9 +245,11 @@ BackupIncremental() {
     fi
 
     tar -cjf "$archivo" -C "$DIR_MYSQL" "${lista_logs[@]}" 2>> "$ARCHIVO_LOG"
-    if [ $? -eq 0 ]; then
-        echo "$binlog_nuevo" > "$MARKER_LAST"
-        RegistrarLog "Respaldo incremental generado con ${#lista_logs[@]} binlogs ($archivo)."
+    local tar_status=$?
+
+    if [ $tar_status -eq 0 ]; then
+        echo "$coords_actuales" > "$MARKER_LAST"
+        RegistrarLog "Respaldo incremental generado con ${#lista_logs[@]} binlogs ($archivo). Coordenadas: $coords_actuales"
         EnviarBackup "$archivo" "diarios"
     else
         RegistrarLog "ERROR al empaquetar incremental de logs binarios."
@@ -264,9 +282,9 @@ case "$1" in
         echo "Uso: $0 {incremental|diferencial|completo}"
         echo
         echo "Opciones:"
-        echo "  incremental  : Respaldo de transacciones del día (Binlogs diarios)"
-        echo "  diferencial  : Respaldo acumulado del mes (Binlogs acumulados)"
-        echo "  completo     : Respaldo lógico total de la base (mysqldump base)"
+        echo "  incremental  : Respaldo de binlogs del día (Nivel 2)"
+        echo "  diferencial  : Respaldo de binlogs acumulados del mes (Nivel 1)"
+        echo "  completo     : Respaldo total mysqldump + coordenadas (Nivel 0)"
         exit 1
         ;;
 esac
