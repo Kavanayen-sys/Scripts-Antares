@@ -1,9 +1,16 @@
+Aquí tienes el script **`sigeru-admin.sh` actualizado**, habiendo eliminado por completo la carga/creación mediante archivos tanto en los menús como en la lógica de ejecución por línea de comandos.
+
+---
+
+### 📜 Script: `/usr/local/bin/sigeru-admin.sh`
+
+```bash
 #!/bin/bash
 
 # ==============================================================================
 # SiGeRU - Sistema de Gestión de Residuos Urbanos
 # Grupo Antares - Script Modular de Administración del Servidor (Rocky Linux 10)
-# Versión 1.3 - Sintaxis Limpia y Control Estricto
+# Versión 1.4 - Administración Interactiva Directa (Sin carga por archivo)
 # ==============================================================================
 
 set -o pipefail
@@ -45,8 +52,8 @@ Pausar() {
 ValidarNombreUsuario() {
     local usr="$1"
     if [[ ! "$usr" =~ ^[a-z_][a-z0-9_-]{1,31}$ ]]; then
-        echo -e "${COLOR_ROJO}ERROR: Nombre de usuario inválido.${COLOR_RESET}"
-        echo -e "${COLOR_AMARILLO}Reglas: Solo letras minúsculas (a-z), números (0-9), guiones (-) y guiones bajos (_). No se admiten espacios ni caracteres especiales.${COLOR_RESET}"
+        echo -e "${COLOR_ROJO}ERROR: Nombre inválido.${COLOR_RESET}"
+        echo -e "${COLOR_AMARILLO}Reglas: Solo minúsculas (a-z), números (0-9), guiones (-) y guiones bajos (_). Sin espacios ni símbolos.${COLOR_RESET}"
         return 1
     fi
     return 0
@@ -70,40 +77,19 @@ ValidarIP() {
     return 0
 }
 
-CargarUsuario() {
+PedirUsuario() {
     unset nombre
     echo
-    echo "1. Escribir nombre de usuario | 2. Cargar desde archivo | 0. Volver"
-    read -p "Opción: " opc_cargar
-    case $opc_cargar in
-        1)
-            read -p "Nombre de usuario: " nombre_input
-            nombre_input=$(echo "$nombre_input" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
-            if [ "$nombre_input" != "0" ] && [ -n "$nombre_input" ]; then
-                if ValidarNombreUsuario "$nombre_input"; then
-                    nombre="$nombre_input"
-                fi
-            fi
-            ;;
-        2)
-            read -p "Ruta del archivo: " ruta_arch
-            if [ -f "$ruta_arch" ]; then
-                local primer_usr=$(awk '{print $1; exit}' "$ruta_arch" | tr '[:upper:]' '[:lower:]' | tr -d '\r')
-                if ValidarNombreUsuario "$primer_usr"; then
-                    nombre="$primer_usr"
-                    echo -e "${COLOR_VERDE}Usuario '$nombre' cargado desde el archivo.${COLOR_RESET}"
-                fi
-            else
-                echo -e "${COLOR_ROJO}El archivo no existe.${COLOR_RESET}"
-            fi
-            ;;
-        0)
-            echo "Operación cancelada."
-            ;;
-        *)
-            echo -e "${COLOR_ROJO}Opción inválida.${COLOR_RESET}"
-            ;;
-    esac
+    read -p "Ingrese el nombre de usuario (o '0' para cancelar): " nombre_input
+    nombre_input=$(echo "$nombre_input" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    
+    if [ "$nombre_input" != "0" ] && [ -n "$nombre_input" ]; then
+        if ValidarNombreUsuario "$nombre_input"; then
+            nombre="$nombre_input"
+        fi
+    else
+        echo "Operación cancelada."
+    fi
 }
 
 # ==============================================================================
@@ -118,16 +104,15 @@ ModuloUsuarios() {
         echo -e "${COLOR_CYAN}=====================================================${COLOR_RESET}"
         echo "1. Agregar usuario"
         echo "2. Eliminar usuario"
-        echo "3. Carga masiva de usuarios desde archivo"
-        echo "4. Modificar cuenta (Bloquear / Desbloquear / Shell)"
-        echo "5. Listar usuarios estándar del sistema (UID >= 1000)"
+        echo "3. Modificar cuenta (Bloquear / Desbloquear / Shell)"
+        echo "4. Listar usuarios estándar del sistema (UID >= 1000)"
         echo "0. Volver al menú principal"
         echo -e "${COLOR_CYAN}-----------------------------------------------------${COLOR_RESET}"
         read -p "Seleccione una opción: " opc
 
         case $opc in
             1)
-                CargarUsuario
+                PedirUsuario
                 if [ -n "$nombre" ]; then
                     if id "$nombre" &>/dev/null; then
                         echo -e "${COLOR_AMARILLO}El usuario '$nombre' ya existe.${COLOR_RESET}"
@@ -137,8 +122,8 @@ ModuloUsuarios() {
                         local pass_inicial="${inicial}#123456"
                         echo "$nombre:$pass_inicial" | chpasswd
                         chage -d 0 "$nombre"
-                        echo -e "${COLOR_VERDE}Usuario '$nombre' creado.${COLOR_RESET}"
-                        echo -e "Contraseña temporal: ${COLOR_AMARILLO}$pass_inicial${COLOR_RESET}"
+                        echo -e "${COLOR_VERDE}Usuario '$nombre' creado exitosamente.${COLOR_RESET}"
+                        echo -e "Contraseña temporal asignada: ${COLOR_AMARILLO}$pass_inicial${COLOR_RESET}"
                         echo "$(date '+%Y-%m-%d %H:%M:%S') - Creado: $nombre" >> "$LOG_USUARIOS"
                         RegistrarAccion "Usuario creado: $nombre"
                     fi
@@ -146,7 +131,7 @@ ModuloUsuarios() {
                 Pausar
                 ;;
             2)
-                CargarUsuario
+                PedirUsuario
                 if [ -n "$nombre" ]; then
                     if id "$nombre" &>/dev/null; then
                         read -p "¿Desea borrar también el directorio /home? (s/n): " resp
@@ -164,50 +149,24 @@ ModuloUsuarios() {
                 Pausar
                 ;;
             3)
-                read -p "Ruta del archivo de usuarios: " ruta_arch
-                if [ -f "$ruta_arch" ]; then
-                    while IFS= read -r linea || [ -n "$linea" ]; do
-                        usr=$(echo "$linea" | awk '{print $1}' | tr '[:upper:]' '[:lower:]' | tr -d '\r')
-                        [ -z "$usr" ] && continue
-                        if ! ValidarNombreUsuario "$usr"; then
-                            echo -e "${COLOR_ROJO}[IGNORADO]${COLOR_RESET} '$usr' no cumple las reglas de nombre."
-                            continue
-                        fi
-                        if id "$usr" &>/dev/null; then
-                            echo -e "${COLOR_AMARILLO}[EXISTE]${COLOR_RESET} $usr"
-                        else
-                            useradd -m -s /bin/bash "$usr"
-                            local inicial=$(echo "${usr:0:1}" | tr '[:lower:]' '[:upper:]')
-                            local pass_tmp="${inicial}#123456"
-                            echo "$usr:$pass_tmp" | chpasswd
-                            chage -d 0 "$usr"
-                            echo -e "${COLOR_VERDE}[CREADO]${COLOR_RESET} $usr (Pass: $pass_tmp)"
-                            echo "$(date '+%Y-%m-%d %H:%M:%S') - Masivo: $usr" >> "$LOG_USUARIOS"
-                        fi
-                    done < "$ruta_arch"
-                    RegistrarAccion "Carga masiva desde: $ruta_arch"
-                else
-                    echo -e "${COLOR_ROJO}El archivo no existe.${COLOR_RESET}"
+                PedirUsuario
+                if [ -n "$nombre" ]; then
+                    if id "$nombre" &>/dev/null; then
+                        echo "a. Bloquear cuenta | b. Desbloquear cuenta | c. Establecer shell /sbin/nologin"
+                        read -p "Opción: " subopc
+                        case $subopc in
+                            a) passwd -l "$nombre" && echo -e "${COLOR_VERDE}Cuenta bloqueada.${COLOR_RESET}" ;;
+                            b) passwd -u "$nombre" && echo -e "${COLOR_VERDE}Cuenta desbloqueada.${COLOR_RESET}" ;;
+                            c) usermod -s /sbin/nologin "$nombre" && echo -e "${COLOR_VERDE}Shell modificado.${COLOR_RESET}" ;;
+                            *) echo -e "${COLOR_ROJO}Opción inválida.${COLOR_RESET}" ;;
+                        esac
+                    else
+                        echo -e "${COLOR_ROJO}El usuario '$nombre' no existe.${COLOR_RESET}"
+                    fi
                 fi
                 Pausar
                 ;;
             4)
-                read -p "Usuario a modificar: " nombre
-                if id "$nombre" &>/dev/null; then
-                    echo "a. Bloquear cuenta | b. Desbloquear cuenta | c. Establecer shell /sbin/nologin"
-                    read -p "Opción: " subopc
-                    case $subopc in
-                        a) passwd -l "$nombre" && echo -e "${COLOR_VERDE}Cuenta bloqueada.${COLOR_RESET}" ;;
-                        b) passwd -u "$nombre" && echo -e "${COLOR_VERDE}Cuenta desbloqueada.${COLOR_RESET}" ;;
-                        c) usermod -s /sbin/nologin "$nombre" && echo -e "${COLOR_VERDE}Shell modificado.${COLOR_RESET}" ;;
-                        *) echo -e "${COLOR_ROJO}Opción inválida.${COLOR_RESET}" ;;
-                    esac
-                else
-                    echo -e "${COLOR_ROJO}El usuario no existe.${COLOR_RESET}"
-                fi
-                Pausar
-                ;;
-            5)
                 echo -e "\n${COLOR_AZUL}--- Usuarios estándar (UID >= 1000) ---${COLOR_RESET}"
                 awk -F: '$3 >= 1000 && $3 < 65534 {printf "Usuario: %-15s UID: %-6s Home: %-20s Shell: %s\n", $1, $3, $6, $7}' /etc/passwd
                 Pausar
@@ -239,6 +198,7 @@ ModuloGrupos() {
 
         case $opc in
             1)
+                echo
                 read -p "Nombre del grupo: " grupo
                 grupo=$(echo "$grupo" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
                 if [ -n "$grupo" ] && [ "$grupo" != "0" ]; then
@@ -254,6 +214,7 @@ ModuloGrupos() {
                 Pausar
                 ;;
             2)
+                echo
                 read -p "Nombre del grupo a eliminar: " grupo
                 if [ -n "$grupo" ] && [ "$grupo" != "0" ]; then
                     if getent group "$grupo" &>/dev/null; then
@@ -266,25 +227,29 @@ ModuloGrupos() {
                 Pausar
                 ;;
             3)
-                read -p "Nombre del usuario: " nombre
-                read -p "Nombre del grupo: " grupo
-                if id "$nombre" &>/dev/null && getent group "$grupo" &>/dev/null; then
-                    usermod -aG "$grupo" "$nombre"
-                    echo -e "${COLOR_VERDE}Usuario '$nombre' agregado a '$grupo'.${COLOR_RESET}"
-                    RegistrarAccion "Usuario $nombre añadido al grupo $grupo"
-                else
-                    echo -e "${COLOR_ROJO}El usuario o el grupo no existen.${COLOR_RESET}"
+                PedirUsuario
+                if [ -n "$nombre" ]; then
+                    read -p "Nombre del grupo al que desea añadirlo: " grupo
+                    if id "$nombre" &>/dev/null && getent group "$grupo" &>/dev/null; then
+                        usermod -aG "$grupo" "$nombre"
+                        echo -e "${COLOR_VERDE}Usuario '$nombre' agregado a '$grupo'.${COLOR_RESET}"
+                        RegistrarAccion "Usuario $nombre añadido al grupo $grupo"
+                    else
+                        echo -e "${COLOR_ROJO}El usuario o el grupo no existen.${COLOR_RESET}"
+                    fi
                 fi
                 Pausar
                 ;;
             4)
-                read -p "Nombre del usuario: " nombre
-                read -p "Nombre del grupo: " grupo
-                if gpasswd -d "$nombre" "$grupo" 2>/dev/null; then
-                    echo -e "${COLOR_VERDE}Usuario '$nombre' eliminado del grupo '$grupo'.${COLOR_RESET}"
-                    RegistrarAccion "Usuario $nombre removido del grupo $grupo"
-                else
-                    echo -e "${COLOR_ROJO}Error al remover usuario del grupo.${COLOR_RESET}"
+                PedirUsuario
+                if [ -n "$nombre" ]; then
+                    read -p "Nombre del grupo del que desea quitarlo: " grupo
+                    if gpasswd -d "$nombre" "$grupo" 2>/dev/null; then
+                        echo -e "${COLOR_VERDE}Usuario '$nombre' eliminado del grupo '$grupo'.${COLOR_RESET}"
+                        RegistrarAccion "Usuario $nombre removido del grupo $grupo"
+                    else
+                        echo -e "${COLOR_ROJO}Error al remover usuario del grupo.${COLOR_RESET}"
+                    fi
                 fi
                 Pausar
                 ;;
@@ -479,7 +444,7 @@ ModuloRedes() {
                     2) ping -c 3 192.168.1.11 ;;
                     3) ping -c 3 192.168.1.12 ;;
                     4)
-                        echo -e "${COLOR_AMARILLO}En Red Interna de VirtualBox no hay un router en .1, por lo que es normal que de 100% pérdida:${COLOR_RESET}"
+                        echo -e "${COLOR_AMARILLO}En Red Interna de VirtualBox no hay router en .1, por lo que puede dar 100% de pérdida:${COLOR_RESET}"
                         ping -c 3 192.168.1.1
                         ;;
                     *) echo -e "${COLOR_ROJO}Opción inválida.${COLOR_RESET}" ;;
@@ -713,7 +678,7 @@ MenuPrincipal() {
         echo -e "${COLOR_CYAN}       SiGeRU - CONSOLA DE ADMINISTRACIÓN DEL SERVIDOR                ${COLOR_RESET}"
         echo -e "${COLOR_CYAN}       Grupo Antares | Rocky Linux 10 Minimal                         ${COLOR_RESET}"
         echo -e "${COLOR_CYAN}======================================================================${COLOR_RESET}"
-        echo -e " 1. ${COLOR_VERDE}[Usuarios]${COLOR_RESET}      Gestión de Usuarios (Creación, Masivo, Baja)"
+        echo -e " 1. ${COLOR_VERDE}[Usuarios]${COLOR_RESET}      Gestión de Usuarios (Creación, Baja, Modificar)"
         echo -e " 2. ${COLOR_VERDE}[Grupos]${COLOR_RESET}        Gestión de Grupos y Membresías"
         echo -e " 3. ${COLOR_VERDE}[Respaldos]${COLOR_RESET}     Rutinas de Backup SiGeRU (GFS: Diario, Semanal, Mensual)"
         echo -e " 4. ${COLOR_VERDE}[Redes]${COLOR_RESET}         Configuración de Red e Interfaces (nmcli)"
@@ -746,29 +711,12 @@ MenuPrincipal() {
 }
 
 # ==============================================================================
-# CONTROL DE FLUJO (INTERACTIVO O LÍNEA DE COMANDOS)
+# CONTROL DE FLUJO
 # ==============================================================================
 
 if [ $# -eq 0 ]; then
     RegistrarAccion "Sesión interactiva iniciada"
     MenuPrincipal
-
-elif [ $# -eq 2 ] && [ "$2" == "archivo" ]; then
-    if [ -f "$1" ]; then
-        nombre=$(awk '{print $1; exit}' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '\r')
-        if ValidarNombreUsuario "$nombre"; then
-            if id "$nombre" &>/dev/null; then
-                userdel -r "$nombre"
-                echo "Usuario '$nombre' eliminado."
-            else
-                useradd -m -s /bin/bash "$nombre"
-                inicial=$(echo "${nombre:0:1}" | tr '[:lower:]' '[:upper:]')
-                echo "$nombre:${inicial}#123456" | chpasswd
-                chage -d 0 "$nombre"
-                echo "Usuario '$nombre' creado."
-            fi
-        fi
-    fi
 
 elif [ $# -eq 1 ]; then
     nombre=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
@@ -785,3 +733,4 @@ elif [ $# -eq 1 ]; then
         fi
     fi
 fi
+```
