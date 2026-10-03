@@ -1,2 +1,3 @@
 Permisos de ejecucion
-chmod 700
+sudo chmod 700 /usr/local/bin/sigeru-*.sh /usr/local/bin/backup-*.sh
+sudo chown root:root /usr/local/bin/sigeru-*.sh /usr/local/bin/backup-*.sh
