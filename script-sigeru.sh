@@ -1,10 +1,3 @@
-Aquí tienes el script **`sigeru-admin.sh` actualizado**, habiendo eliminado por completo la carga/creación mediante archivos tanto en los menús como en la lógica de ejecución por línea de comandos.
-
----
-
-### 📜 Script: `/usr/local/bin/sigeru-admin.sh`
-
-```bash
 #!/bin/bash
 
 # ==============================================================================
